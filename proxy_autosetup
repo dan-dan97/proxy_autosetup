@@ -1,0 +1,159 @@
+#!/bin/bash
+
+PING_TIMEOUT_MILLISEC=500
+PING_RETRIES_NUMBER=2
+PING_BYTES=32
+
+PROXY_CONFIG='
+sch239.net|proxy.sch239.net=proxy.sch239.net:3128;
+'
+
+min_substring_before() { 
+	echo ${1%%$2*}
+}
+
+max_substring_before() { 
+	echo ${1%$2*}
+}
+
+min_substring_after() { 
+	echo ${1##*$2}
+}
+
+max_substring_after() { 
+	echo ${1#*$2}
+}
+
+substring_index() { 
+	x=${1%%$2*}
+	[[ "$x" = "$1" ]] && echo -1 || echo "${#x}"
+}
+
+count_char(){
+	size=${1//[^$2]}
+	echo ${#size}	
+}
+
+delete_chars(){
+	echo $1 | tr -d "$2"
+}
+
+execute_for_all_users_with_dbus(){
+	
+	USERS_INFO=$(awk -F ':' '$3 >= 1000 && $1 != "nobody" {printf "%s %s\n", $1, $3}' /etc/passwd)
+	IFS=$'\n'
+	for USER_INFO in $USERS_INFO; do
+		USER_NAME=$(echo $USER_INFO | awk -F ' ' '{print $1}')
+		USER_UID=$(echo $USER_INFO | awk -F ' ' '{print $2}')
+		if [ -e /run/user/$USER_UID/dbus-session ]; then
+			USER_DBUS_ADDRESS=$(cat /run/user/$USER_UID/dbus-session | grep DBUS_SESSION_BUS_ADDRESS)
+			if [ -n "$USER_DBUS_ADDRESS" ]; then
+				sudo -u $USER_NAME bash -c "export $USER_DBUS_ADDRESS ; $1 ; unset DBUS_SESSION_BUS_ADDRESS"
+			fi
+		fi
+	done
+}
+
+set_no_proxy(){
+	execute_for_all_users_with_dbus "dconf write /system/proxy/mode \"'none'\""
+
+	sed -i '/http_proxy/d' /etc/environment
+	sed -i '/https_proxy/d' /etc/environment
+	sed -i '/ftp_proxy/d' /etc/environment
+	sed -i '/socks_proxy/d' /etc/environment
+
+	sed -i '/Acquire::http::proxy/d' /etc/apt/apt.conf
+	sed -i '/Acquire::https::proxy/d' /etc/apt/apt.conf
+	sed -i '/Acquire::ftp::proxy/d' /etc/apt/apt.conf
+	sed -i '/Acquire::socks::proxy/d' /etc/apt/apt.conf
+}
+
+set_proxy(){
+	SET_PROXY_IP=$1
+	SET_PROXY_PORT=$2
+	if [ ${#SET_PROXY_PORT} = '0' ]; then SET_PROXY_PORT='0'; fi
+
+	execute_for_all_users_with_dbus "dconf write /system/proxy/mode \"'manual'\"; dconf write /system/proxy/use-same-proxy \"'false'\"; dconf write /system/proxy/http/enabled \"'true'\"; dconf write /system/proxy/http/host \"'$SET_PROXY_IP'\"; dconf write /system/proxy/http/port \"$SET_PROXY_PORT\"; dconf write /system/proxy/https/host \"'$SET_PROXY_IP'\"; dconf write /system/proxy/https/port \"$SET_PROXY_PORT\"; dconf write /system/proxy/ftp/host \"'$SET_PROXY_IP'\"; dconf write /system/proxy/ftp/port \"$SET_PROXY_PORT\"; dconf write /system/proxy/socks/host \"'$SET_PROXY_IP'\"; dconf write /system/proxy/socks/port \"$SET_PROXY_PORT\""
+
+	sed -i '/http_proxy/d' /etc/environment
+	sed -i '/https_proxy/d' /etc/environment
+	sed -i '/ftp_proxy/d' /etc/environment
+	sed -i '/socks_proxy/d' /etc/environment
+
+	PROXY_URL=$SET_PROXY_IP':'$SET_PROXY_PORT
+
+	echo 'http_proxy="http://'$PROXY_URL'/"' >> /etc/environment
+	echo 'https_proxy="https://'$PROXY_URL'/"' >> /etc/environment
+	echo 'ftp_proxy="ftp://'$PROXY_URL'/"' >> /etc/environment
+	echo 'socks_proxy="socks://'$PROXY_URL'/"' >> /etc/environment
+
+	sed -i '/Acquire::http::proxy/d' /etc/apt/apt.conf
+	sed -i '/Acquire::https::proxy/d' /etc/apt/apt.conf
+	sed -i '/Acquire::ftp::proxy/d' /etc/apt/apt.conf
+	sed -i '/Acquire::socks::proxy/d' /etc/apt/apt.conf
+
+	echo 'Acquire::http::proxy "http://'$PROXY_URL'/";' >> /etc/apt/apt.conf
+	echo 'Acquire::https::proxy "https://'$PROXY_URL'/";' >> /etc/apt/apt.conf
+	echo 'Acquire::ftp::proxy "ftp://'$PROXY_URL'/";' >> /etc/apt/apt.conf
+	echo 'Acquire::socks::proxy "socks://'$PROXY_URL'/";' >> /etc/apt/apt.conf
+}
+
+is_host_alive(){
+	if [[ -z $1 ]]; then return 1; fi
+	fping -q -t $PING_TIMEOUT_MILLISEC -r $PING_RETRIES_NUMBER -b $PING_BYTES $1
+	if [ $? = '0' ]; then return 0; else return 1; fi
+}
+
+is_ssid_online(){
+	if [ "$(iwgetid -r)" = "$1" ]; then return 0; else return 1; fi
+}
+
+PROXY_FOUND=false
+
+IFS=$';'
+for CONFIG in $PROXY_CONFIG; do
+	CONFIG=$(delete_chars $CONFIG ' \n')
+	if [ "$(count_char $CONFIG '|')" -gt "0" ] && [ "$(count_char $CONFIG '&')" -gt "0" ]; then continue; fi
+	if [ "$(count_char $CONFIG '|')" -gt "1" ] || [ "$(count_char $CONFIG '&')" -gt "1" ] || [ "$(count_char $CONFIG '=')" -gt "1" ] || [ "$(count_char $CONFIG ':')" -ne "1" ]; then continue; fi
+	if [ "$(count_char $CONFIG '|')" -eq "0" ] && [ "$(count_char $CONFIG '&')" -eq "0" ]; then
+		if [ "$(count_char $CONFIG '=')" -ne "0" ]; then
+			if [ "$(substring_index $CONFIG '=')" -lt "$(substring_index $CONFIG ':')" ]; then
+				CONFIG=$(max_substring_after $CONFIG '=')
+			else continue; fi
+		fi
+	else
+		if [ "$(substring_index $CONFIG '=')" -gt "$(substring_index $CONFIG ':')" ] || [ "$(substring_index $CONFIG '&')" -gt "$(substring_index $CONFIG '=')" ] || [ "$(substring_index $CONFIG '|')" -gt "$(substring_index $CONFIG '=')" ]; then continue; fi
+		if [ "$(count_char $CONFIG '|')" -eq "1" ]; then
+			CHECK_SSID=$(max_substring_before $CONFIG '|')
+			CONFIG=$(max_substring_after $CONFIG '|')
+			CHECK_IP=$(max_substring_before $CONFIG '=')
+			CONFIG=$(max_substring_after $CONFIG '=')
+			
+			if is_host_alive $CHECK_IP || is_ssid_online $CHECK_SSID; then CONDITIONS_OK=true; else CONDITIONS_OK=false; fi
+			if [ ${#CHECK_SSID} = '0' ] && [ ${#CHECK_IP} = '0' ]; then NO_CONDITIONS=true; else NO_CONDITIONS=false; fi
+			if ! $CONDITIONS_OK && ! $NO_CONDITIONS; then continue; fi
+		else
+			CHECK_SSID=$(max_substring_before $CONFIG '&')
+			CONFIG=$(max_substring_after $CONFIG '&')
+			CHECK_IP=$(max_substring_before $CONFIG '=')
+			CONFIG=$(max_substring_after $CONFIG '=')
+
+			if [ ${#CHECK_SSID} != '0' ] && ! is_ssid_online $CHECK_SSID; then continue; fi
+			if [ ${#CHECK_IP} != '0' ] && ! is_host_alive $CHECK_IP; then continue; fi
+		fi
+	fi
+	PROXY_FOUND=true
+	PROXY_IP=$(max_substring_before $CONFIG ':')
+	PROXY_PORT=$(max_substring_after $CONFIG ':')
+	break
+done
+
+if $PROXY_FOUND; then
+	set_proxy $PROXY_IP $PROXY_PORT
+else
+	set_no_proxy
+fi
+
+# echo "PROXY_IP: "$PROXY_IP" PROXY_PORT: "$PROXY_PORT
+
+exit 0
